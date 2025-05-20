@@ -173,23 +173,41 @@ def process_excel_with_isbns(df, progress_bar=None, status_container=None, statu
     
     return df, stats, messages
 
-# Barra lateral con estadísticas
+# Función para cargar el índice de ISBNs
+def load_isbn_index():
+    if os.path.exists(JSON_FILE):
+        with open(JSON_FILE, 'r', encoding='utf-8') as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return {}
+    return {}
+
+# Función para guardar el índice de ISBNs
+def save_isbn_index(isbn_index):
+    with open(JSON_FILE, 'w', encoding='utf-8') as f:
+        json.dump(isbn_index, f, indent=2, ensure_ascii=False)
+
+# Función para validar ISBN
+def validate_isbn(isbn):
+    isbn_clean = ''.join(c for c in isbn if c.isdigit() or c == 'X' or c == 'x')
+    return is_isbn10(isbn_clean) or is_isbn13(isbn_clean)
+
+# Barra lateral con estadísticas y gestión manual de ISBNs
 with st.sidebar:
     st.header("Estadísticas")
     
     # Cargar y mostrar estadísticas del cache de ISBNs
-    if os.path.exists(JSON_FILE):
-        with open(JSON_FILE, 'r', encoding='utf-8') as f:
-            try:
-                isbn_index = json.load(f)
-                st.info(f"Total de ISBNs en la base de datos: {len(isbn_index)}")
-            except:
-                st.warning("No se pudo leer el archivo de base de datos.")
+    isbn_index = load_isbn_index()
+    isbn_count = len(isbn_index)
+    
+    if isbn_count > 0:
+        st.info(f"Total de ISBNs en la base de datos: {isbn_count}")
     else:
         st.info("No hay base de datos de ISBNs creada todavía.")
     
     # Opción para descargar o limpiar la base de datos
-    if os.path.exists(JSON_FILE):
+    if isbn_count > 0:
         with open(JSON_FILE, 'r', encoding='utf-8') as f:
             try:
                 isbn_data = f.read()
@@ -206,6 +224,120 @@ with st.sidebar:
                     st.rerun()
             except:
                 st.warning("Error al acceder a la base de datos.")
+    
+    # Sección para gestión manual de ISBNs
+    st.header("Gestión Manual de ISBNs")
+    
+    # Pestañas para añadir o eliminar ISBNs
+    tab1, tab2 = st.tabs(["Añadir ISBN", "Eliminar ISBN"])
+    
+    with tab1:
+        st.subheader("Añadir ISBN a la base de datos")
+        st.markdown("Puedes añadir varios ISBNs separados por espacios.")
+        isbns_to_add = st.text_area("ISBN(s)", key="add_isbn", placeholder="Introduce uno o varios ISBNs separados por espacios")
+        release_date = st.text_input("Fecha de lanzamiento", key="add_date")
+        
+        if st.button("Añadir a la base de datos", key="btn_add"):
+            if isbns_to_add and release_date:
+                # Dividir la entrada en múltiples ISBNs
+                isbn_list = isbns_to_add.strip().split()
+                
+                # Variables para seguimiento del proceso
+                successful_isbns = []
+                invalid_isbns = []
+                
+                # Procesar cada ISBN
+                for isbn in isbn_list:
+                    # Limpiar ISBN de caracteres no numéricos
+                    isbn_clean = ''.join(c for c in isbn if c.isdigit() or c == 'X' or c == 'x')
+                    
+                    # Validar ISBN
+                    if validate_isbn(isbn_clean):
+                        # Convertir ISBN-10 a ISBN-13 para consistencia si es necesario
+                        if is_isbn10(isbn_clean):
+                            isbn_clean = to_isbn13(isbn_clean)
+                        
+                        # Actualizar la base de datos
+                        isbn_index[isbn_clean] = release_date
+                        successful_isbns.append(isbn_clean)
+                    else:
+                        invalid_isbns.append(isbn)
+                
+                # Guardar los cambios en la base de datos
+                if successful_isbns:
+                    save_isbn_index(isbn_index)
+                    st.success(f"Se añadieron {len(successful_isbns)} ISBNs correctamente con fecha {release_date}.")
+                    
+                    # Mostrar los ISBNs añadidos en una lista expandible
+                    with st.expander("Ver ISBNs añadidos"):
+                        for isbn in successful_isbns:
+                            st.code(f"{isbn}: {release_date}")
+                
+                # Mostrar ISBNs inválidos si hay alguno
+                if invalid_isbns:
+                    st.error(f"No se pudieron añadir {len(invalid_isbns)} ISBNs inválidos: {', '.join(invalid_isbns)}")
+                
+                if successful_isbns:
+                    st.rerun()
+            else:
+                st.warning("Por favor, introduce tanto el ISBN como la fecha de lanzamiento.")
+    
+    with tab2:
+        st.subheader("Eliminar ISBN de la base de datos")
+        isbns_to_remove = st.text_area("ISBN(s) a eliminar", key="remove_isbn", placeholder="Introduce uno o varios ISBNs separados por espacios")
+        
+        # Mostrar opción para buscar en la base de datos
+        if st.checkbox("Buscar en la base de datos", key="search_db"):
+            search_term = st.text_input("Término de búsqueda", key="search_term")
+            if search_term:
+                results = {k: v for k, v in isbn_index.items() if search_term in k}
+                if results:
+                    st.write(f"Resultados encontrados ({len(results)}):")
+                    for k, v in results.items():
+                        st.code(f"{k}: {v}")
+                else:
+                    st.info("No se encontraron resultados.")
+        
+        if st.button("Eliminar de la base de datos", key="btn_remove"):
+            if isbns_to_remove:
+                # Dividir la entrada en múltiples ISBNs
+                isbn_list = isbns_to_remove.strip().split()
+                
+                # Variables para seguimiento del proceso
+                removed_isbns = []
+                not_found_isbns = []
+                
+                # Procesar cada ISBN
+                for isbn in isbn_list:
+                    # Limpiar ISBN de caracteres no numéricos
+                    isbn_clean = ''.join(c for c in isbn if c.isdigit() or c == 'X' or c == 'x')
+                    
+                    # Verificar si el ISBN existe en la base de datos
+                    if isbn_clean in isbn_index:
+                        # Eliminar el ISBN
+                        del isbn_index[isbn_clean]
+                        removed_isbns.append(isbn_clean)
+                    else:
+                        not_found_isbns.append(isbn_clean)
+                
+                # Guardar los cambios en la base de datos
+                if removed_isbns:
+                    save_isbn_index(isbn_index)
+                    st.success(f"Se eliminaron {len(removed_isbns)} ISBNs correctamente.")
+                    
+                    # Mostrar los ISBNs eliminados en una lista expandible
+                    with st.expander("Ver ISBNs eliminados"):
+                        for isbn in removed_isbns:
+                            st.code(isbn)
+                
+                # Mostrar ISBNs no encontrados si hay alguno
+                if not_found_isbns:
+                    st.warning(f"{len(not_found_isbns)} ISBNs no encontrados en la base de datos: {', '.join(not_found_isbns)}")
+                
+                if removed_isbns:
+                    st.rerun()
+            else:
+                st.warning("Por favor, introduce el ISBN que deseas eliminar.")
 
 # Instrucciones
 with st.expander("📋 Instrucciones de uso", expanded=True):
@@ -214,6 +346,9 @@ with st.expander("📋 Instrucciones de uso", expanded=True):
     2. El sistema añadirá una nueva columna con las fechas de lanzamiento de cada ISBN.
     3. El sistema primero comprobará si el ISBN existe en la base de datos local, y si no, buscará la información a través de APIs externas.
     4. Cuando termine el proceso, podrás descargar el archivo Excel procesado.
+    5. Puedes añadir o eliminar ISBNs manualmente usando las opciones en la barra lateral:
+       - Para añadir: Introduce uno o varios ISBNs separados por espacios y la fecha de lanzamiento
+       - Para eliminar: Introduce uno o varios ISBNs separados por espacios
     """)
 
 # Carga de archivo
@@ -327,4 +462,5 @@ st.markdown("### Acerca de")
 st.markdown("""
 Esta aplicación busca fechas de lanzamiento para ISBNs utilizando varias APIs (Google Books y Open Library).
 Los ISBNs encontrados se almacenan en una base de datos local para acelerar futuras búsquedas.
+La aplicación también permite gestionar manualmente los ISBNs en la base de datos, pudiendo añadir o eliminar varios ISBNs a la vez.
 """)
