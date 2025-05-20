@@ -5,7 +5,6 @@ import requests
 import time
 import os
 import io
-import random
 from isbnlib import is_isbn10, is_isbn13, to_isbn13
 
 # Configurar título y descripción de la página
@@ -17,67 +16,54 @@ os.makedirs('uploads', exist_ok=True)
 os.makedirs('downloads', exist_ok=True)
 JSON_FILE = 'isbn_index.json'
 
-# Función para buscar ISBN en API con reintentos y backoff exponencial
-def fetch_isbn_date_from_api(isbn, max_retries=3, initial_timeout=10):
+# Función para buscar ISBN en API
+def fetch_isbn_date_from_api(isbn):
     # Convertir cualquier ISBN-10 a ISBN-13 para consistencia
     if is_isbn10(isbn):
         isbn = to_isbn13(isbn)
     
-    # Función para intentar una solicitud con reintentos y backoff exponencial
-    def make_request_with_retry(url, current_retry=0, timeout=initial_timeout):
-        if current_retry >= max_retries:
-            return None  # Agotamos los reintentos
-        
-        try:
-            response = requests.get(url, timeout=timeout)
-            if response.status_code == 200:
-                return response.json()
-            # Si el código no es 200, consideramos reintento
-            time.sleep(0.5 * (current_retry + 1))
-            return make_request_with_retry(url, current_retry + 1, timeout * 1.5)
-        except requests.exceptions.Timeout:
-            # En caso de timeout, aumentamos el timeout en el siguiente intento
-            time.sleep(0.5 * (current_retry + 1))
-            return make_request_with_retry(url, current_retry + 1, timeout * 1.5)
-        except requests.exceptions.ConnectionError as e:
-            # Esperamos un poco antes de reintentar en caso de error de conexión
-            time.sleep(1 * (current_retry + 1))
-            return make_request_with_retry(url, current_retry + 1, timeout * 1.5)
-        except Exception as e:
-            if current_retry < max_retries - 1:
-                time.sleep(1 * (current_retry + 1))
-                return make_request_with_retry(url, current_retry + 1, timeout * 1.5)
-            return None
-    
     # Intentamos primero con Google Books API
-    url_google = f"https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}"
-    data_google = make_request_with_retry(url_google)
+    url = f"https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}"
     
-    if data_google and data_google.get('totalItems', 0) > 0:
-        published_date = data_google['items'][0]['volumeInfo'].get('publishedDate', 'Desconocido')
-        # Formateamos como YYYY o DD-MM-YY según la longitud
-        if len(published_date) == 4:  # Solo año
+    try:
+        # Aumentado el timeout de 5 a 15 segundos
+        response = requests.get(url, timeout=15)
+        data = response.json()
+        
+        # Si encontramos resultados
+        if data.get('totalItems', 0) > 0:
+            published_date = data['items'][0]['volumeInfo'].get('publishedDate', 'Desconocido')
+            # Formateamos como YYYY o DD-MM-YY según la longitud
+            if len(published_date) == 4:  # Solo año
+                return published_date, True
+            elif len(published_date) >= 10:  # Fecha completa
+                date_parts = published_date.split('-')
+                if len(date_parts) >= 3:
+                    return f"{date_parts[2][:2]}-{date_parts[1]}-{date_parts[0][2:]}", True
             return published_date, True
-        elif len(published_date) >= 10:  # Fecha completa
-            date_parts = published_date.split('-')
-            if len(date_parts) >= 3:
-                return f"{date_parts[2][:2]}-{date_parts[1]}-{date_parts[0][2:]}", True
-        return published_date, True
+    except Exception as e:
+        # Si falla Google Books, no mostramos el error inmediatamente
+        # sino que continuamos con OpenLibrary
+        pass
     
-    # Si no hay resultados con Google Books o falla, intentamos con Open Library
-    # con un timeout mayor, ya que parece más propenso a timeouts
-    url_ol = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
-    data_ol = make_request_with_retry(url_ol, timeout=15)  # Timeout mayor para Open Library
-    
-    if data_ol and f"ISBN:{isbn}" in data_ol:
-        publish_date = data_ol[f"ISBN:{isbn}"].get("publish_date", "Desconocido")
-        # Intentamos formatear la fecha si es posible
-        try:
-            if len(publish_date) == 4:  # Solo año
+    # Si no hay resultados con Google Books, intentamos con Open Library
+    try:
+        url_ol = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
+        # Aumentado el timeout a 20 segundos
+        response_ol = requests.get(url_ol, timeout=20)
+        data_ol = response_ol.json()
+        
+        if f"ISBN:{isbn}" in data_ol:
+            publish_date = data_ol[f"ISBN:{isbn}"].get("publish_date", "Desconocido")
+            # Intentamos formatear la fecha si es posible
+            try:
+                if len(publish_date) == 4:  # Solo año
+                    return publish_date, True
                 return publish_date, True
-            return publish_date, True
-        except:
-            return publish_date, True
+            except:
+                return publish_date, True
+    except Exception as e:
+        st.error(f"Error al buscar ISBN {isbn}: {e}")
     
     return "No encontrado", False  # Si no se encuentra en ninguna API
 
@@ -150,28 +136,25 @@ def process_excel_with_isbns(df, progress_bar=None, status_container=None, statu
             # Si no está en el índice, buscar en la API
             messages.append(f"🔍 Buscando fecha para ISBN {isbn_clean} en API...")
             
-            try:
-                date, found = fetch_isbn_date_from_api(isbn_clean)
+            date, found = fetch_isbn_date_from_api(isbn_clean)
+            
+            # Almacenar el resultado en el índice
+            if found:
+                isbn_index[isbn_clean] = date
+                new_isbns_added += 1
+                stats["from_api"] += 1
+                messages.append(f"ISBN {isbn_clean} resultado: {date}")
                 
-                # Almacenar el resultado en el índice
-                if found:
-                    isbn_index[isbn_clean] = date
-                    new_isbns_added += 1
-                    stats["from_api"] += 1
-                    messages.append(f"ISBN {isbn_clean} resultado: {date}")
-                else:
-                    stats["not_found"] += 1
-                    messages.append(f"ISBN {isbn_clean} no encontrado")
-                
-                release_dates.append(date)
-            except Exception as e:
-                # Capturar cualquier error durante el procesamiento
+                # Guardar cada 2 ISBN añadido para no perder progreso
+                if new_isbns_added % 2 == 0:
+                    with open(JSON_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(isbn_index, f, indent=2, ensure_ascii=False)
+            else:
                 stats["not_found"] += 1
-                error_msg = f"Error al procesar ISBN {isbn_clean}: {str(e)}"
-                messages.append(error_msg)
-                release_dates.append("Error: No procesado")
+                messages.append(f"ISBN {isbn_clean} no encontrado")
             
             stats["pending"] -= 1
+            release_dates.append(date)
             
             # Actualizar estadísticas en tiempo real y mostrar mensajes
             if status_placeholder:
@@ -188,13 +171,8 @@ def process_excel_with_isbns(df, progress_bar=None, status_container=None, statu
                 status_text += "\n".join(messages[-10:])
                 status_placeholder.text(status_text)
             
-            # Guardar regularmente para no perder progreso
-            if new_isbns_added > 0 and new_isbns_added % 5 == 0:
-                with open(JSON_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(isbn_index, f, indent=2, ensure_ascii=False)
-            
-            # Esperar un breve tiempo para no sobrecargar la API, con jitter aleatorio
-            time.sleep(0.5 + random.uniform(0, 0.5))
+            # Esperar un breve tiempo para no sobrecargar la API
+            time.sleep(0.5)
     
     # Añadir la columna de fechas al DataFrame
     df['Fecha de Lanzamiento'] = release_dates
@@ -203,137 +181,6 @@ def process_excel_with_isbns(df, progress_bar=None, status_container=None, statu
     if new_isbns_added > 0:
         with open(JSON_FILE, 'w', encoding='utf-8') as f:
             json.dump(isbn_index, f, indent=2, ensure_ascii=False)
-    
-    return df, stats, messages
-
-# Función para procesar por lotes
-def process_excel_with_isbns_batch(df, batch_size=10, progress_bar=None, status_container=None, status_placeholder=None):
-    # Cargar el índice existente de ISBNs
-    isbn_index = {}
-    if os.path.exists(JSON_FILE):
-        with open(JSON_FILE, 'r', encoding='utf-8') as f:
-            try:
-                isbn_index = json.load(f)
-            except json.JSONDecodeError:
-                isbn_index = {}
-    
-    # Verificar que hay al menos una columna
-    if df.shape[1] == 0:
-        st.error("El archivo Excel no tiene columnas.")
-        return None, None, None
-    
-    # Asegurarnos de que la primera columna sea tratada como texto
-    original_col_name = df.columns[0]
-    df[original_col_name] = df[original_col_name].astype(str)
-    
-    # Extraer los ISBNs de la primera columna
-    isbns = df.iloc[:, 0].astype(str).str.strip()
-    
-    # Crear una nueva columna para las fechas de lanzamiento
-    release_dates = ["Pendiente"] * len(isbns)
-    
-    # Estadísticas iniciales
-    total_isbns = len(isbns)
-    stats = {
-        "total": total_isbns, 
-        "from_cache": 0, 
-        "from_api": 0, 
-        "not_found": 0, 
-        "pending": total_isbns,
-        "processed": 0
-    }
-    
-    messages = []
-    new_isbns_added = 0
-    
-    # Procesar en lotes
-    for batch_start in range(0, len(isbns), batch_size):
-        batch_end = min(batch_start + batch_size, len(isbns))
-        
-        # Procesar cada ISBN en el lote actual
-        for i in range(batch_start, batch_end):
-            isbn = isbns[i]
-            
-            # Actualizar progreso
-            if progress_bar is not None:
-                progress_bar.progress((i + 1) / len(isbns))
-            
-            # Limpiar ISBN
-            isbn_clean = ''.join(c for c in isbn if c.isdigit() or c == 'X' or c == 'x')
-            
-            # Verificar si está en caché
-            if isbn_clean in isbn_index:
-                release_dates[i] = isbn_index[isbn_clean]
-                stats["from_cache"] += 1
-                stats["pending"] -= 1
-                stats["processed"] += 1
-                messages.append(f"ISBN {isbn_clean} encontrado en caché: {isbn_index[isbn_clean]}")
-            else:
-                try:
-                    messages.append(f"🔍 Buscando fecha para ISBN {isbn_clean} en API...")
-                    date, found = fetch_isbn_date_from_api(isbn_clean)
-                    
-                    if found:
-                        isbn_index[isbn_clean] = date
-                        new_isbns_added += 1
-                        stats["from_api"] += 1
-                        messages.append(f"ISBN {isbn_clean} resultado: {date}")
-                    else:
-                        stats["not_found"] += 1
-                        messages.append(f"ISBN {isbn_clean} no encontrado")
-                    
-                    release_dates[i] = date
-                except Exception as e:
-                    stats["not_found"] += 1
-                    error_msg = f"Error al procesar ISBN {isbn_clean}: {str(e)}"
-                    messages.append(error_msg)
-                    release_dates[i] = "Error: No procesado"
-                
-                stats["pending"] -= 1
-                stats["processed"] += 1
-            
-            # Actualizar estadísticas en tiempo real
-            if status_placeholder:
-                status_text = (
-                    f"ISBNs procesados: {stats['processed']}/{stats['total']} "
-                    f"(Caché: {stats['from_cache']}, API: {stats['from_api']}, "
-                    f"No encontrados: {stats['not_found']}, Pendientes: {stats['pending']})\n\n"
-                )
-                status_text += "\n".join(messages[-5:])  # Mostrar menos mensajes para no sobrecargar
-                status_placeholder.text(status_text)
-            
-            # Esperar un breve tiempo para no sobrecargar la API, con jitter aleatorio
-            if isbn_clean not in isbn_index:
-                time.sleep(0.5 + random.uniform(0, 0.5))
-        
-        # Guardar progreso después de cada lote
-        df['Fecha de Lanzamiento'] = release_dates
-        
-        if new_isbns_added > 0:
-            with open(JSON_FILE, 'w', encoding='utf-8') as f:
-                json.dump(isbn_index, f, indent=2, ensure_ascii=False)
-        
-        # Permitir descarga parcial después de cada lote
-        if batch_end < len(isbns):
-            # Mostrar opción para descargar parcialmente
-            st.warning(f"Procesados {batch_end} de {len(isbns)} ISBNs. Puedes descargar lo procesado hasta ahora.")
-            
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                export_df = df.copy()
-                export_df.to_excel(writer, index=False, sheet_name='ISBNs')
-                workbook = writer.book
-                worksheet = writer.sheets['ISBNs']
-                for row_idx in range(2, len(export_df) + 2):
-                    worksheet[f"A{row_idx}"].number_format = '@'
-            
-            buffer.seek(0)
-            st.download_button(
-                label="Descargar resultados parciales",
-                data=buffer,
-                file_name=f"ISBNs_procesados_parcial_{batch_end}_de_{len(isbns)}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
     
     return df, stats, messages
 
@@ -513,7 +360,6 @@ with st.expander("📋 Instrucciones de uso", expanded=True):
     5. Puedes añadir o eliminar ISBNs manualmente usando las opciones en la barra lateral:
        - Para añadir: Introduce uno o varios ISBNs separados por espacios y la fecha de lanzamiento
        - Para eliminar: Introduce uno o varios ISBNs separados por espacios
-    6. Modo por lotes: Para archivos grandes o en entornos con limitaciones de tiempo (como Streamlit Cloud gratuito), usa el modo por lotes para procesar grupos pequeños de ISBNs y evitar timeouts.
     """)
 
 # Carga de archivo
@@ -544,16 +390,6 @@ if uploaded_file is not None:
         if df.shape[0] == 0:
             st.error("El archivo no contiene datos")
         else:
-            # Añadir opciones para procesamiento por lotes
-            st.subheader("Opciones de procesamiento")
-            processing_method = st.radio(
-                "Selecciona el método de procesamiento",
-                ["Procesar todo de una vez", "Procesar por lotes (recomendado para Streamlit Cloud)"]
-            )
-            
-            if processing_method == "Procesar por lotes (recomendado para Streamlit Cloud)":
-                batch_size = st.slider("Tamaño de lote", min_value=5, max_value=50, value=10, help="Número de ISBNs a procesar en cada lote")
-            
             # Procesar archivo cuando el usuario haga clic en el botón
             if st.button("Procesar ISBNs", type="primary"):
                 st.subheader("Procesando archivo...")
@@ -566,33 +402,19 @@ if uploaded_file is not None:
                 status_placeholder = st.empty()
                 
                 # Procesar el archivo
-                if processing_method == "Procesar todo de una vez":
-                    result_df, stats, messages = process_excel_with_isbns(df, progress_bar, status_container, status_placeholder)
-                else:
-                    result_df, stats, messages = process_excel_with_isbns_batch(df, batch_size, progress_bar, status_container, status_placeholder)
+                result_df, stats, messages = process_excel_with_isbns(df, progress_bar, status_container, status_placeholder)
                 
                 if result_df is not None:
                     # Mostrar estadísticas finales
                     st.success(f"Proceso completado. Se procesaron {stats['total']} ISBNs")
                     
-                    if processing_method == "Procesar todo de una vez":
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("ISBNs del caché", stats["from_cache"])
-                        with col2:
-                            st.metric("ISBNs de la API", stats["from_api"])
-                        with col3:
-                            st.metric("ISBNs no encontrados", stats["not_found"])
-                    else:
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("ISBNs del caché", stats["from_cache"])
-                        with col2:
-                            st.metric("ISBNs de la API", stats["from_api"])
-                        with col3:
-                            st.metric("ISBNs no encontrados", stats["not_found"])
-                        with col4:
-                            st.metric("Total procesados", stats["processed"])
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("ISBNs del caché", stats["from_cache"])
+                    with col2:
+                        st.metric("ISBNs de la API", stats["from_api"])
+                    with col3:
+                        st.metric("ISBNs no encontrados", stats["not_found"])
                     
                     # Mostrar resultado
                     st.subheader("Resultado")
@@ -619,3 +441,37 @@ if uploaded_file is not None:
                         worksheet = writer.sheets['ISBNs']
                         
                         # Aplicar formato de texto a la columna de ISBNs
+                        for col_idx, col_name in enumerate(export_df.columns):
+                            col_letter = chr(65 + col_idx)  # A, B, C, etc.
+                            for row_idx in range(2, len(export_df) + 2):  # Excel es 1-indexed y tenemos header
+                                cell = f"{col_letter}{row_idx}"
+                                if col_name == export_df.columns[0]:  # Si es la columna de ISBNs
+                                    # Aplicar formato de texto
+                                    worksheet[cell].number_format = '@'
+                    
+                    # Obtener los datos del buffer
+                    buffer.seek(0)
+                    
+                    # Botón de descarga
+                    st.download_button(
+                        label="Descargar archivo procesado",
+                        data=buffer,
+                        file_name="ISBNs_procesados.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                    
+                    # Mostrar el log completo de procesamiento
+                    with st.expander("Ver log completo de procesamiento"):
+                        for msg in messages:
+                            st.text(msg)
+    except Exception as e:
+        st.error(f"Error al procesar el archivo: {e}")
+
+# Mostrar información adicional al final
+st.markdown("---")
+st.markdown("### Acerca de")
+st.markdown("""
+Esta aplicación busca fechas de lanzamiento para ISBNs utilizando varias APIs (Google Books y Open Library).
+Los ISBNs encontrados se almacenan en una base de datos local para acelerar futuras búsquedas.
+La aplicación también permite gestionar manualmente los ISBNs en la base de datos, pudiendo añadir o eliminar varios ISBNs a la vez.
+""")
