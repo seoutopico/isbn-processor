@@ -6,6 +6,7 @@ import time
 import os
 import io
 from isbnlib import is_isbn10, is_isbn13, to_isbn13
+from threading import Thread
 
 # Configurar título y descripción de la página
 st.set_page_config(page_title="Procesador de ISBNs", page_icon="📚", layout="wide")
@@ -15,6 +16,16 @@ st.title("Procesador de ISBNs")
 os.makedirs('uploads', exist_ok=True)
 os.makedirs('downloads', exist_ok=True)
 JSON_FILE = 'isbn_index.json'
+
+# Creación de un estado compartido para seguimiento
+if 'processing_complete' not in st.session_state:
+    st.session_state.processing_complete = False
+if 'current_stats' not in st.session_state:
+    st.session_state.current_stats = {"total": 0, "from_cache": 0, "from_api": 0, "not_found": 0, "pending": 0}
+if 'isbn_count' not in st.session_state:
+    st.session_state.isbn_count = 0
+if 'needs_update' not in st.session_state:
+    st.session_state.needs_update = False
 
 # Función para buscar ISBN en API
 def fetch_isbn_date_from_api(isbn):
@@ -107,6 +118,9 @@ def process_excel_with_isbns(df, progress_bar=None, status_container=None, statu
         "pending": isbns_to_search
     }
     
+    # Actualizar el estado de sesión con las estadísticas actuales
+    st.session_state.current_stats = stats.copy()
+    
     # Mostrar estadísticas iniciales
     if status_container:
         status_container.text(f"Total de ISBNs a procesar: {stats['total']}")
@@ -149,12 +163,19 @@ def process_excel_with_isbns(df, progress_bar=None, status_container=None, statu
                 if new_isbns_added % 2 == 0:
                     with open(JSON_FILE, 'w', encoding='utf-8') as f:
                         json.dump(isbn_index, f, indent=2, ensure_ascii=False)
+                    
+                    # Actualizar contador de ISBNs en la sesión
+                    st.session_state.isbn_count = len(isbn_index)
+                    st.session_state.needs_update = True
             else:
                 stats["not_found"] += 1
                 messages.append(f"ISBN {isbn_clean} no encontrado")
             
             stats["pending"] -= 1
             release_dates.append(date)
+            
+            # Actualizar las estadísticas en el estado de la sesión
+            st.session_state.current_stats = stats.copy()
             
             # Actualizar estadísticas en tiempo real y mostrar mensajes
             if status_placeholder:
@@ -181,8 +202,20 @@ def process_excel_with_isbns(df, progress_bar=None, status_container=None, statu
     if new_isbns_added > 0:
         with open(JSON_FILE, 'w', encoding='utf-8') as f:
             json.dump(isbn_index, f, indent=2, ensure_ascii=False)
+        
+        # Actualizar contador final de ISBNs
+        st.session_state.isbn_count = len(isbn_index)
+    
+    # Marcar como completado
+    st.session_state.processing_complete = True
     
     return df, stats, messages
+
+# Función auxiliar para procesar en segundo plano
+def process_in_background(df, progress_bar, status_container, status_placeholder):
+    result = process_excel_with_isbns(df, progress_bar, status_container, status_placeholder)
+    st.session_state.result = result
+    st.session_state.processing_complete = True
 
 # Función para cargar el índice de ISBNs
 def load_isbn_index():
@@ -204,21 +237,23 @@ def validate_isbn(isbn):
     isbn_clean = ''.join(c for c in isbn if c.isdigit() or c == 'X' or c == 'x')
     return is_isbn10(isbn_clean) or is_isbn13(isbn_clean)
 
+# Inicializar el contador de ISBNs si es necesario
+if st.session_state.isbn_count == 0:
+    isbn_index = load_isbn_index()
+    st.session_state.isbn_count = len(isbn_index)
+
 # Barra lateral con estadísticas y gestión manual de ISBNs
 with st.sidebar:
     st.header("Estadísticas")
     
-    # Cargar y mostrar estadísticas del cache de ISBNs
-    isbn_index = load_isbn_index()
-    isbn_count = len(isbn_index)
-    
-    if isbn_count > 0:
-        st.info(f"Total de ISBNs en la base de datos: {isbn_count}")
+    # Mostrar contador de ISBNs desde el estado de sesión
+    if st.session_state.isbn_count > 0:
+        st.info(f"Total de ISBNs en la base de datos: {st.session_state.isbn_count}")
     else:
         st.info("No hay base de datos de ISBNs creada todavía.")
     
     # Opción para descargar o limpiar la base de datos
-    if isbn_count > 0:
+    if st.session_state.isbn_count > 0:
         with open(JSON_FILE, 'r', encoding='utf-8') as f:
             try:
                 isbn_data = f.read()
@@ -232,6 +267,7 @@ with st.sidebar:
                 if st.button("Limpiar base de datos", type="secondary"):
                     os.remove(JSON_FILE)
                     st.success("Base de datos limpiada correctamente.")
+                    st.session_state.isbn_count = 0
                     st.rerun()
             except:
                 st.warning("Error al acceder a la base de datos.")
@@ -250,6 +286,9 @@ with st.sidebar:
         
         if st.button("Añadir a la base de datos", key="btn_add"):
             if isbns_to_add and release_date:
+                # Cargar índice actual
+                isbn_index = load_isbn_index()
+                
                 # Dividir la entrada en múltiples ISBNs
                 isbn_list = isbns_to_add.strip().split()
                 
@@ -279,6 +318,9 @@ with st.sidebar:
                     save_isbn_index(isbn_index)
                     st.success(f"Se añadieron {len(successful_isbns)} ISBNs correctamente con fecha {release_date}.")
                     
+                    # Actualizar el contador en la sesión
+                    st.session_state.isbn_count = len(isbn_index)
+                    
                     # Mostrar los ISBNs añadidos en una lista expandible
                     with st.expander("Ver ISBNs añadidos"):
                         for isbn in successful_isbns:
@@ -299,6 +341,8 @@ with st.sidebar:
         
         # Mostrar opción para buscar en la base de datos
         if st.checkbox("Buscar en la base de datos", key="search_db"):
+            # Cargar índice actual
+            isbn_index = load_isbn_index()
             search_term = st.text_input("Término de búsqueda", key="search_term")
             if search_term:
                 results = {k: v for k, v in isbn_index.items() if search_term in k}
@@ -311,6 +355,9 @@ with st.sidebar:
         
         if st.button("Eliminar de la base de datos", key="btn_remove"):
             if isbns_to_remove:
+                # Cargar índice actual
+                isbn_index = load_isbn_index()
+                
                 # Dividir la entrada en múltiples ISBNs
                 isbn_list = isbns_to_remove.strip().split()
                 
@@ -336,6 +383,9 @@ with st.sidebar:
                     save_isbn_index(isbn_index)
                     st.success(f"Se eliminaron {len(removed_isbns)} ISBNs correctamente.")
                     
+                    # Actualizar el contador en la sesión
+                    st.session_state.isbn_count = len(isbn_index)
+                    
                     # Mostrar los ISBNs eliminados en una lista expandible
                     with st.expander("Ver ISBNs eliminados"):
                         for isbn in removed_isbns:
@@ -349,6 +399,11 @@ with st.sidebar:
                     st.rerun()
             else:
                 st.warning("Por favor, introduce el ISBN que deseas eliminar.")
+
+# Verificar si necesitamos actualizar la interfaz debido a nuevos ISBNs
+if st.session_state.needs_update:
+    st.session_state.needs_update = False
+    st.rerun()
 
 # Instrucciones
 with st.expander("📋 Instrucciones de uso", expanded=True):
@@ -400,6 +455,13 @@ if uploaded_file is not None:
                 # Crear contenedor para mensajes de estado
                 status_container = st.container()
                 status_placeholder = st.empty()
+                
+                # Ejecutar una primera actualización cada segundo para mantener las estadísticas actualizadas
+                update_placeholder = st.empty()
+                
+                # Configurar el contador de actualizaciones para la sesión
+                if 'update_counter' not in st.session_state:
+                    st.session_state.update_counter = 0
                 
                 # Procesar el archivo
                 result_df, stats, messages = process_excel_with_isbns(df, progress_bar, status_container, status_placeholder)
